@@ -1,9 +1,9 @@
-import serial
 import time
 import argparse
 import csv
 from datetime import datetime
 from typing import Optional, Tuple
+import serial.tools.list_ports
 
 """
 KISS受信＆解析ツール
@@ -167,24 +167,56 @@ def analyze_packet(payload: bytes, expected_counter: int, packet_size: int, pn9_
                 diff = recv_pn9[i] ^ expected_pn9[i]
                 bit_errors += bin(diff).count('1')
         else:
-             return ("PN9_LEN_ERR", recv_counter, 0)
+            return ("PN9_LEN_ERR", recv_counter, 0)
         
         if bit_errors > 0:
             return ("DATA_CORRUPT", recv_counter, bit_errors)
 
     return ("OK", recv_counter, 0)
 
-# === メイン処理 ===
 def main():
-    parser = argparse.ArgumentParser(description="KISS受信・解析ツール")
-    parser.add_argument("--port", default=RX_PORT, help="受信シリアルポート")
+    # --- 引数解析の準備 ---
+    parser = argparse.ArgumentParser(description="KISS受信・解析ツール (CUI高信頼モード)")
+    parser.add_argument("--port", default=None, help="指定しない場合は対話モードで選択")
     parser.add_argument("--baud", type=int, default=BAUDRATE, help="ボーレート")
-    parser.add_argument("--size", type=int, default=PACKET_SIZE, help="送信側と同じパケットサイズを指定")
-    parser.add_argument("--pn9-seed", type=lambda x: int(x, 0), default=0x1FF, help="送信側と同じシード")
-    parser.add_argument("--pn9-reset-each", action="store_true", help="送信側がreset-eachなら指定")
-    parser.add_argument("--log", default="rx_log.csv", help="ログ保存ファイル名")
+    parser.add_argument("--size", type=int, default=PACKET_SIZE, help="パケットサイズ")
+    parser.add_argument("--pn9-seed", type=lambda x: int(x, 0), default=0x1FF, help="PN9初期シード")
+    parser.add_argument("--pn9-reset-each", action="store_true", help="パケット毎リセット")
+    parser.add_argument("--log", default="rx_log.csv", help="ログファイル名")
     
     args = parser.parse_args()
+
+    # ==========================================
+    # ★ ポート選択ロジック (ここを追加・変更) ★
+    # ==========================================
+    selected_port = args.port
+
+    # ポートがコマンド引数で指定されていなければ、リストから選ばせる
+    if selected_port is None:
+        print("\n=== SERIAL PORT SELECTION ===")
+        ports = list(serial.tools.list_ports.comports())
+        
+        if not ports:
+            print(" [ERROR] No serial ports found!")
+            return
+
+        for i, p in enumerate(ports):
+            print(f"  [{i}] {p.device} ({p.description})")
+        
+        print("=============================")
+        while True:
+            try:
+                val = input(f"Select Port Number (0-{len(ports)-1}) > ")
+                idx = int(val)
+                if 0 <= idx < len(ports):
+                    selected_port = ports[idx].device
+                    break
+                else:
+                    print("Invalid number.")
+            except ValueError:
+                print("Please enter a number.")
+    
+    # ==========================================
 
     # 初期化
     if not args.pn9_reset_each:
@@ -197,56 +229,49 @@ def main():
     bit_error_packets = 0
     
     # ログファイル準備
-    with open(args.log, mode='w', newline='') as logfile:
-        writer = csv.writer(logfile)
-        writer.writerow(["Timestamp", "Status", "RecvCounter", "ExpectedCounter", "BitErrors", "RawHex"])
-        
-        print(f"Waiting for data on {args.port}...")
-        print(f"Config: Size={args.size}, ResetPN9={args.pn9_reset_each}")
-        print("-" * 60)
+    # ファイル名にタイムスタンプをつけて上書き防止するとさらに安全かも
+    log_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.log}"
 
-        try:
-            with serial.Serial(args.port, args.baud, timeout=0.1) as ser:
+    print(f"\n[TARGET LOCKED] Port: {selected_port}, Baud: {args.baud}")
+    print(f"Logging to: {log_filename}")
+    print("-" * 60)
+
+    try:
+        with open(log_filename, mode='w', newline='') as logfile:
+            writer = csv.writer(logfile)
+            writer.writerow(["Timestamp", "Status", "RecvCounter", "ExpectedCounter", "BitErrors", "RawHex"])
+            
+            with serial.Serial(selected_port, args.baud, timeout=0.1) as ser:
                 reader = KissReader(ser)
                 
                 while True:
                     frame = reader.read_frame()
                     if frame is None:
-                        continue # データ待ち
+                        continue 
                     
                     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                     
-                    # 連続モードの場合の同期ズレ補正準備
-                    # 解析前に現在のLFSR状態をバックアップ（失敗時のロールバック用等、今回は簡易実装）
-                    
-                    # まずパケットからカウンタだけ読んで、ロスがあったらLFSRを空回しする
-                    # フレーム構造: [CMD(1)] [ID(1)] [CNT(2)] ...
-                    # 最低でも4バイト必要
-                    temp_status = "UNKNOWN"
-                    recv_cnt = -1
-                    bit_err = 0
-                    
-                    # 簡易解析でカウンタを取得して同期合わせ
-                    packet_len_ok = False
+                    # --- 以下、元の解析ロジックと同じ ---
                     start_idx = 0
                     if len(frame) > 0 and frame[0] == 0x00: start_idx = 1
                     
+                    recv_cnt = -1
+                    bit_err = 0
+                    
+                    # 簡易解析・同期
                     if len(frame) >= (start_idx + 3) and frame[start_idx] == 0x42:
                         recv_cnt = (frame[start_idx+1] << 8) | frame[start_idx+2]
                         
-                        # パケットロス判定とLFSR同期
                         if not args.pn9_reset_each:
                             diff = (recv_cnt - next_expected_counter) & 0xFFFF
-                            if diff > 0 and diff < 1000: # 1000パケット以内の抜けならロスとみなす
-                                print(f"!! LOSS DETECTED: Skipped {diff} packets (Exp: {next_expected_counter}, Got: {recv_cnt})")
+                            if diff > 0 and diff < 1000:
+                                print(f"!! LOSS DETECTED: Skipped {diff} packets")
                                 packet_loss_count += diff
-                                # 抜けた分のPN9を空回しして捨てる
                                 pn9_bytes_per_pkt = args.size - 3
                                 if pn9_bytes_per_pkt > 0:
                                     generate_pn9_bytes_continuous(pn9_bytes_per_pkt * diff)
                                 next_expected_counter = recv_cnt
-                            elif diff > 60000: # カウンタが一周した場合などの逆転現象（リセット扱い）
-                                # ここでは単純に同期させる
+                            elif diff > 60000:
                                 next_expected_counter = recv_cnt
 
                     # 詳細解析
@@ -266,28 +291,29 @@ def main():
                         else:
                             print(f"[{timestamp}] BAD Seq={valid_cnt} {status}")
 
-                    # 次の期待値
                     if valid_cnt != -1:
                         next_expected_counter = (valid_cnt + 1) & 0xFFFF
                     
-                    # ログ書き込み
                     writer.writerow([timestamp, status, valid_cnt, next_expected_counter, bit_err, frame.hex()])
-                    logfile.flush() # リアルタイムで書き込む
+                    logfile.flush()
 
-        except KeyboardInterrupt:
-            print("\n" + "="*30)
-            print(" STATISTICS")
-            print("="*30)
-            print(f"Total Received Packets: {total_packets}")
-            print(f"OK Packets:             {ok_packets}")
-            print(f"Packet Loss Detected:   {packet_loss_count}")
-            print(f"Corrupted Packets:      {bit_error_packets}")
-            if total_packets > 0:
-                print(f"Success Rate:           {(ok_packets/total_packets)*100:.2f}%")
-            print(f"Log saved to: {args.log}")
+    except KeyboardInterrupt:
+        print("\n" + "="*30)
+        print(" STATISTICS (FINAL)")
+        print("="*30)
+        print(f"Total Received: {total_packets}")
+        print(f"OK Packets:     {ok_packets}")
+        print(f"Packet Loss:    {packet_loss_count}")
+        print(f"Bit Errors:     {bit_error_packets}")
+        if total_packets > 0:
+            rate = (ok_packets / total_packets) * 100
+            print(f"Success Rate:   {rate:.2f}%")
+        print(f"Log saved to:   {log_filename}")
 
-        except serial.SerialException as e:
-            print(f"Serial Error: {e}")
+    except serial.SerialException as e:
+        print(f"[CRITICAL] Serial Error: {e}")
+
+# ... (if __name__ == "__main__": main() はそのまま)
 
 if __name__ == "__main__":
     main()
