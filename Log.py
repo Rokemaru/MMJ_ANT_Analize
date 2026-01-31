@@ -39,8 +39,8 @@ class KissProtocol:
 class LogDecoderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("MMJ LOG DECODER (破損率計算機能付き)")
-        self.root.geometry("900x650") # 少し横長にしました
+        self.root.title("MMJ LOG DECODER (全体統計機能付き)")
+        self.root.geometry("950x700") 
         
         self.col_bg = "#000500"
         self.col_fg = "#33ff33"
@@ -48,6 +48,7 @@ class LogDecoderApp:
         
         self.root.configure(bg=self.col_bg)
         self.results = [] 
+        self.global_stats = {} # 全体統計保存用
 
         self.setup_ui()
         self.log_sys("システム準備完了。TeraTermログを読み込んでください。")
@@ -89,11 +90,11 @@ class LogDecoderApp:
         btn_frame.pack(fill=tk.X, pady=(0, 10))
 
         self.btn_analyze = tk.Button(btn_frame, text=">>> 解析実行 (ANALYZE) <<<", command=self.start_analysis,
-                                    bg=self.col_dim, fg=self.col_fg, font=("Meiryo", 12, "bold"), relief="flat", height=2)
+                                     bg=self.col_dim, fg=self.col_fg, font=("Meiryo", 12, "bold"), relief="flat", height=2)
         self.btn_analyze.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
 
         self.btn_save = tk.Button(btn_frame, text="[ CSV保存 ]", command=self.save_csv,
-                                bg=self.col_dim, fg=self.col_fg, font=("Meiryo", 12, "bold"), relief="flat", height=2, state="disabled")
+                                  bg=self.col_dim, fg=self.col_fg, font=("Meiryo", 12, "bold"), relief="flat", height=2, state="disabled")
         self.btn_save.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # 4. LOG
@@ -102,6 +103,7 @@ class LogDecoderApp:
         self.log_area.tag_config("ERR", foreground="#ff5555")
         self.log_area.tag_config("OK", foreground=self.col_fg)
         self.log_area.tag_config("WARN", foreground="#ffff55")
+        self.log_area.tag_config("STAT", foreground="#00ffff", font=("Meiryo", 11, "bold")) # 統計用
 
     def log_sys(self, msg, tag="OK"):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -133,6 +135,7 @@ class LogDecoderApp:
     def process_log(self, path, packet_size):
         self.log_sys("--- 解析プロセス開始 ---")
         self.results = []
+        self.global_stats = {}
         proto = KissProtocol()
         
         try:
@@ -163,6 +166,10 @@ class LogDecoderApp:
             
             ok_count = 0
             err_count = 0
+            
+            # === 全体統計用アキュムレータ ===
+            accum_total_bits = 0
+            accum_total_errors = 0
 
             for idx, frame in enumerate(found_packets):
                 if len(frame) < 3: continue
@@ -179,7 +186,7 @@ class LogDecoderApp:
                 rx_hex = frame.hex()
                 
                 bit_errors = 0
-                error_rate_percent = 0.0 # 破損率
+                error_rate_percent = 0.0 
                 status = "OK"
                 
                 if len(actual_pn9) == len(exp_pn9):
@@ -187,13 +194,13 @@ class LogDecoderApp:
                         diff = b_rx ^ b_tx
                         bit_errors += bin(diff).count('1')
                     
-                    # ★ 破損率の計算 ★
                     if total_bits_per_packet > 0:
                         error_rate_percent = (bit_errors / total_bits_per_packet) * 100.0
                         
                 else:
                     status = "SIZE_ERR"
-                    error_rate_percent = 100.0 # サイズエラーは全損扱い
+                    error_rate_percent = 100.0 
+                    bit_errors = total_bits_per_packet # サイズエラー時は全ビットエラー扱い
                 
                 if bit_errors > 0:
                     status = "DATA_CORRUPT"
@@ -201,6 +208,10 @@ class LogDecoderApp:
                 else:
                     ok_count += 1
                 
+                # 全体統計に加算
+                accum_total_bits += total_bits_per_packet
+                accum_total_errors += bit_errors
+
                 self.results.append({
                     "Index": idx,
                     "Status": status,
@@ -208,16 +219,32 @@ class LogDecoderApp:
                     "RxHex": rx_hex,
                     "TxHex": tx_hex,
                     "BitErrors": bit_errors,
-                    "ErrorRate(%)": f"{error_rate_percent:.2f}" # 小数点2桁まで
+                    "ErrorRate(%)": f"{error_rate_percent:.2f}"
                 })
 
-            self.log_sys(f"--- 解析レポート ---")
-            self.log_sys(f"総パケット数: {len(found_packets)}")
-            self.log_sys(f"正常 (OK): {ok_count} 個", "OK")
-            self.log_sys(f"破損 (CORRUPT): {err_count} 個", "ERR" if err_count > 0 else "OK")
+            # === 全体統計の計算 ===
+            global_ber = 0.0
+            if accum_total_bits > 0:
+                global_ber = (accum_total_errors / accum_total_bits) * 100.0
+            
+            # 結果を保存
+            self.global_stats = {
+                "TotalPackets": len(found_packets),
+                "TotalBits": accum_total_bits,
+                "TotalErrors": accum_total_errors,
+                "GlobalBER": global_ber
+            }
+
+            self.log_sys("------------------------------")
+            self.log_sys("【 全体統計レポート (GLOBAL STATS) 】", "STAT")
+            self.log_sys(f" 総受信パケット数 : {len(found_packets)} 個", "STAT")
+            self.log_sys(f" 総受信ビット数   : {accum_total_bits} bits", "STAT")
+            self.log_sys(f" 総エラービット数 : {accum_total_errors} bits", "STAT")
+            self.log_sys(f" ★全体ビット破損率 : {global_ber:.4f} %", "STAT")
+            self.log_sys("------------------------------")
             
             if len(found_packets) > 0:
-                self.log_sys("完了しました。[CSV保存] ボタンを押してください。", "OK")
+                self.log_sys("完了しました。[CSV保存] を押すと、この統計も末尾に追加されます。", "OK")
                 self.root.after(0, lambda: self.btn_save.config(state="normal", bg=self.col_fg, fg=self.col_bg))
             else:
                 self.log_sys("警告: パケットが見つかりませんでした。", "WARN")
@@ -236,15 +263,25 @@ class LogDecoderApp:
             try:
                 with open(f, "w", newline="") as csvfile:
                     writer = csv.writer(csvfile)
-                    # ヘッダーに「ErrorRate(%)」を追加
+                    # ヘッダー
                     writer.writerow(["Index", "Status", "RecvCounter", "RxHex", "TxHex", "BitErrors", "ErrorRate(%)"])
+                    
+                    # データ行
                     for row in self.results:
                         writer.writerow([
                             row["Index"], row["Status"], row["RecvCounter"],
                             row["RxHex"], row["TxHex"], row["BitErrors"], row["ErrorRate(%)"]
                         ])
+                    
+                    # 末尾に全体統計を追加（Excelで見やすいように空白行を挟む）
+                    writer.writerow([])
+                    writer.writerow(["=== GLOBAL STATISTICS ==="])
+                    writer.writerow(["Total Received Bits", self.global_stats["TotalBits"]])
+                    writer.writerow(["Total Bit Errors", self.global_stats["TotalErrors"]])
+                    writer.writerow(["Global Bit Error Rate (%)", f"{self.global_stats['GlobalBER']:.4f}"])
+
                 self.log_sys(f"保存完了: {os.path.basename(f)}", "OK")
-                messagebox.showinfo("成功", "破損率付きCSVを保存しました！")
+                messagebox.showinfo("成功", "解析結果と全体統計を保存しました！")
             except Exception as e:
                 self.log_sys(f"保存エラー: {e}", "ERR")
 
